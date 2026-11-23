@@ -1,7 +1,7 @@
-# Projeto final: surrogate e POD-NN para aerofólios
-# - estágio 1: rede que recebe os 12 CST, alpha e log10 Re e devolve cl, log10 cd e cm
-# - estágio 2: POD-NN que prevê a curva de Cp inteira (200 pontos). A SVD acha os modos e uma rede pequena aprende os 17 coeficientes
-# - os dois usam o mesmo split por aerofólio, e a NACA 2412 só entra no final
+# Projeto final: surrogate neural para aerofólios
+# - rede que recebe os 12 CST, alpha e log10 Re e devolve cl, log10 cd e cm
+# - a ideia é substituir o XFOIL na previsão dos coeficientes
+# - a NACA 2412 fica fora do treino, validação e teste e só entra no final
 
 import copy
 import os
@@ -71,7 +71,7 @@ teste = uni[uni['id'].isin(ids_te)]
 print('Aerofólios treino/val/teste:', len(ids_tr), len(ids_val), len(ids_te))
 print('Pontos treino/val/teste:', len(treino), len(val), len(teste))
 
-# Estágio 1: preparação
+# Preparação
 # - X tem 14 colunas (12 CST, alpha e log10 Re) e Y tem 3 (cl, log10 cd, cm)
 # - média e desvio só do treino, aplicados nos outros conjuntos (inclusive a NACA 2412)
 
@@ -108,11 +108,10 @@ Entrada_teste = torch.tensor(X_teste)
 Entrada_target = torch.tensor(X_target)
 
 
-# Estágio 1: rede e treino
+# Rede e treino
 # - 2 camadas ocultas de 64 neurônios com tanh e saída linear
 # - MSE, Adam e mini-lotes de 256
 # - early stopping: se a validação não melhora por 20 épocas, para e volta aos pesos da melhor época
-# - a função `treina` também serve pro estágio 2
 
 def treina(rede, X, Y, Xv, Yv, lr=1e-3, batch=256, paciencia=20, max_epocas=500):
     # Adam + MSE + early stopping, devolve históricos, melhor época e melhor erro de validação
@@ -252,6 +251,9 @@ for Re_val in np.unique(Re_na):
 
 # Curvas de aprendizado
 # - erro de treino e validação por época (escala log), com a melhor época marcada
+# - as duas curvas caem rápido nas primeiras épocas e depois melhoram devagar
+# - a validação fica um pouco acima do treino (são formas que a rede não viu), mas a diferença é pequena e não cresce, então quase não tem sobreajuste
+# - o treino parou na época 156 e os pesos guardados são da época 136
 
 def grafico_MSExepoca(hist_treino, hist_val, melhor_epoca):
     plt.figure(figsize=(6, 4))
@@ -265,130 +267,6 @@ def grafico_MSExepoca(hist_treino, hist_val, melhor_epoca):
 
 grafico_MSExepoca(hist_treino, hist_val, melhor_epoca)
 
-# Estágio 2: POD-NN para o Cp
-# - o Cp só existe pra Re = 1e6 e alpha de 0 a 8 graus, então não tem entrada de Reynolds e só vale nessa faixa
-# - mesmos aerofólios de treino, validação e teste do estágio 1
-# - alguns aerofólios ficam sem Cp porque a limpeza do banco tirou os polares de Re = 1e6
-
-d = np.load(DB / 'cp_Re1e6.npz')
-cp_id, cp_alpha, x_grid, cp = d['id'], d['alpha'], d['x'], d['cp'].astype(np.float64)
-
-m_tr = np.isin(cp_id, ids_tr)
-m_val = np.isin(cp_id, ids_val)
-m_te = np.isin(cp_id, ids_te)
-id_naca = int(airfoils.loc[airfoils['name'] == 'naca2412', 'id'].iloc[0])
-m_na = (cp_id == id_naca)
-
-print('Curvas de Cp treino/val/teste/NACA:', m_tr.sum(), m_val.sum(), m_te.sum(), m_na.sum())
-print('Aerofólios com Cp no treino:', len(np.unique(cp_id[m_tr])))
-
-# Padrões (SVD)
-# - subtraio a curva média do treino e monto a matriz 200 x N curvas
-# - SVD econômica, as colunas de U são os modos POD
-# - fico com o menor r que chega a 99,9% da energia acumulada
-
-cp_medio = cp[m_tr].mean(axis=0)               # curva média do treino
-X_snap = (cp[m_tr] - cp_medio).T               # 200 x N_treino
-U, S, Vt = np.linalg.svd(X_snap, full_matrices=False)
-
-energia = S ** 2 / np.sum(S ** 2)
-energia_acum = np.cumsum(energia)
-r = int(np.argmax(energia_acum >= 0.999)) + 1
-Phi = U[:, :r]                                 # 200 x r
-
-print(f'r = {r} modos para 99,9 % da energia (E(r) = {energia_acum[r - 1]:.5f})')
-print('Energia dos 4 primeiros modos (%):', np.round(energia[:4] * 100, 2))
-
-fig, ax = plt.subplots(1, 2, figsize=(11, 4))
-ax[0].semilogy(np.arange(1, 41), energia[:40], 'o-')
-ax[0].set_xlabel('modo j'); ax[0].set_ylabel('σ_j² / Σσ²'); ax[0].set_title('Energia de cada modo')
-ax[1].plot(np.arange(1, 41), energia_acum[:40], 'o-')
-ax[1].axhline(0.999, color='k', ls='--', lw=1)
-ax[1].axvline(r, color='r', ls='--', lw=1, label=f'r = {r}')
-ax[1].set_xlabel('r'); ax[1].set_ylabel('E(r)'); ax[1].set_title('Energia acumulada'); ax[1].legend()
-plt.tight_layout()
-plt.show()
-
-fig, ax = plt.subplots(1, 4, figsize=(16, 3.6))
-for j in range(4):
-    ax[j].plot(x_grid, Phi[:100, j], label='superior')
-    ax[j].plot(x_grid, Phi[100:, j], '--', label='inferior')
-    ax[j].set_title(f'Modo {j + 1} ({energia[j] * 100:.1f} %)')
-    ax[j].set_xlabel('x/c')
-ax[0].legend()
-plt.tight_layout()
-plt.show()
-
-# Gabarito e piso de projeção
-# - modos ortonormais, então os coeficientes são a = Phi^T (Cp - média)
-# - projetar todas as curvas dá o gabarito que a rede tenta prever
-# - piso de projeção: erro de reconstruir o teste com os coeficientes exatos, é o melhor possível com r modos
-
-A_all = (cp - cp_medio) @ Phi                  # N x r
-
-
-def reconstroi(A):
-    return cp_medio + A @ Phi.T
-
-
-rmse_piso = np.sqrt(np.mean((reconstroi(A_all[m_te]) - cp[m_te]) ** 2))
-rmse_piso_na = np.sqrt(np.mean((reconstroi(A_all[m_na]) - cp[m_na]) ** 2))
-print(f'Piso de projeção (teste): RMSE de Cp = {rmse_piso:.5f}')
-
-# Rede do estágio 2
-# - entradas: 12 CST e alpha (13, padronizadas com o treino)
-# - saídas: os r coeficientes divididos pelo desvio do primeiro
-# - padronizar cada coeficiente separado daria o mesmo peso pros modos de pouca energia, e a perda não acompanharia mais o erro da curva
-
-cst = airfoils.set_index('id')[X_columns[:12]]
-X_cp = np.column_stack([cst.loc[cp_id].values, cp_alpha]).astype(np.float32)
-
-mx2, sx2 = X_cp[m_tr].mean(axis=0), X_cp[m_tr].std(axis=0)
-X_cp_s = (X_cp - mx2) / sx2
-
-escala = A_all[m_tr][:, 0].std()               # um número só pra todos os coeficientes
-A_s = (A_all / escala).astype(np.float32)
-
-E_tr, S_tr = torch.tensor(X_cp_s[m_tr]), torch.tensor(A_s[m_tr])
-E_va, S_va = torch.tensor(X_cp_s[m_val]), torch.tensor(A_s[m_val])
-
-torch.manual_seed(0)
-rede2 = nn.Sequential(
-    nn.Linear(13, 64), nn.Tanh(),
-    nn.Linear(64, 64), nn.Tanh(),
-    nn.Linear(64, r)
-)
-h_tr2, h_va2, melhor_epoca2, melhor_val2 = treina(
-    rede2, E_tr, S_tr, E_va, S_va, batch=128, paciencia=30, max_epocas=1000)
-print('Estágio 2: melhor época', melhor_epoca2, '| MSE de validação:', melhor_val2)
-
-# Uso e resultado
-# - a soma dos modos com os coeficientes previstos reconstrói o Cp
-# - comparo o RMSE do teste com o piso de projeção
-# - gráfico da NACA 2412 em 0, 4 e 8 graus
-
-with torch.no_grad():
-    A_prev = rede2(torch.tensor(X_cp_s)).numpy() * escala
-cp_prev = reconstroi(A_prev)
-
-rmse_pod = np.sqrt(np.mean((cp_prev[m_te] - cp[m_te]) ** 2))
-rmse_pod_na = np.sqrt(np.mean((cp_prev[m_na] - cp[m_na]) ** 2))
-print(f'POD-NN (teste): RMSE de Cp = {rmse_pod:.5f} | piso = {rmse_piso:.5f}')
-print(f'NACA 2412: RMSE de Cp = {rmse_pod_na:.5f} | piso = {rmse_piso_na:.5f}')
-
-fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-for k, al in enumerate([0, 4, 8]):
-    i = np.where(m_na & (cp_alpha == al))[0][0]
-    ax[k].plot(x_grid, cp[i, :100], 'o', ms=3, color='C0')            # XFOIL, superior
-    ax[k].plot(x_grid, cp[i, 100:], 'o', ms=3, color='C1')            # XFOIL, inferior
-    ax[k].plot(x_grid, cp_prev[i, :100], '-', color='C0', label='superior')
-    ax[k].plot(x_grid, cp_prev[i, 100:], '--', color='C1', label='inferior')
-    ax[k].invert_yaxis()                                              # convenção: Cp negativo em cima
-    ax[k].set_xlabel('x/c'); ax[k].set_ylabel('Cp'); ax[k].set_title(f'NACA 2412, α = {al}°')
-ax[0].legend()
-plt.tight_layout()
-plt.show()
-
 
 # Fontes
 #
@@ -397,7 +275,6 @@ plt.show()
 # - PyTorch, otimizador Adam: https://pytorch.org/docs/stable/generated/torch.optim.Adam.html
 # - PyTorch, DataLoader e TensorDataset: https://pytorch.org/docs/stable/data.html
 # - PyTorch, tutorial de como montar uma rede: https://pytorch.org/tutorials/beginner/basics/buildmodel_tutorial.html
-# - NumPy, SVD (np.linalg.svd): https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html
 # - NumPy, ajuste de reta (np.polyfit): https://numpy.org/doc/stable/reference/generated/numpy.polyfit.html
 # - pandas, juntar tabelas (pd.merge): https://pandas.pydata.org/docs/reference/api/pandas.merge.html
 # - matplotlib, gráficos (plt.subplots): https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.subplots.html
@@ -409,6 +286,5 @@ plt.show()
 #
 # Métodos
 # - Adam: Kingma e Ba (2014): https://arxiv.org/abs/1412.6980
-# - POD (Proper Orthogonal Decomposition): https://en.wikipedia.org/wiki/Proper_orthogonal_decomposition
 # - early stopping: Goodfellow et al., Deep Learning, cap. 7: https://www.deeplearningbook.org/
 # - coeficientes CST: Kulfan (2008), Universal Parametric Geometry Representation Method, Journal of Aircraft
