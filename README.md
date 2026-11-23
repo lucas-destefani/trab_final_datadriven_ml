@@ -76,7 +76,7 @@ tde/
 ├── apresentacao/
 │   ├── Apresentacao_Projeto_Final_PT.pptx
 │   └── Final_Project_Presentation_EN.pptx
-├── figuras/                     figuras geradas pelo código
+├── figuras/                     figuras usadas na apresentação
 └── old/                         versões antigas
 ```
 
@@ -90,4 +90,4 @@ cd codigo
 python projeto_final.py
 ```
 
-O código procura a pasta `airfoil_db_v1_to_students` ao lado de `codigo` ou uma pasta acima, e grava as figuras em `figuras`. Dá para trocar os caminhos com as variáveis de ambiente `DB` e `FIG`. O notebook `projeto_final.ipynb` tem o mesmo código. No Colab, o código monta o Drive e lê os arquivos de `MyDrive/Data Driven`. O treino do estágio 1 leva alguns minutos em CPU.
+O código procura a pasta `airfoil_db_v1_to_students` ao lado de `codigo` ou uma pasta acima (dá para trocar o caminho com a variável de ambiente `DB`) e mostra as figuras na tela, sem salvar nada em disco. O notebook `projeto_final.ipynb` tem o mesmo código. No Colab, o código monta o Drive e lê os arquivos de `MyDrive/Data Driven`. O treino do estágio 1 leva alguns minutos em CPU.

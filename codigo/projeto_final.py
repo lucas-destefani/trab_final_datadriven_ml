@@ -1,3 +1,7 @@
+# Projeto final: surrogate e POD-NN para aerofólios
+# - estágio 1: rede que recebe os 12 CST, alpha e log10 Re e devolve cl, log10 cd e cm
+# - estágio 2: POD-NN que prevê a curva de Cp inteira (200 pontos). A SVD acha os modos e uma rede pequena aprende os 17 coeficientes
+# - os dois usam o mesmo split por aerofólio, e a NACA 2412 só entra no final
 
 import copy
 import os
@@ -14,7 +18,6 @@ try:
     from google.colab import drive
     drive.mount('/content/drive')
     DB = Path('/content/drive/MyDrive/Data Driven')
-    FIG = Path('/content/figuras')
 except ImportError:
     try:
         AQUI = Path(__file__).resolve().parent
@@ -22,44 +25,34 @@ except ImportError:
         AQUI = Path.cwd()
     pasta = next((p for p in (AQUI, AQUI.parent) if (p / 'airfoil_db_v1_to_students').exists()), AQUI)
     DB = Path(os.environ.get('DB', pasta / 'airfoil_db_v1_to_students'))
-    FIG = Path(os.environ.get('FIG', pasta / 'figuras'))
-FIG.mkdir(exist_ok=True)
 
 torch.manual_seed(0)
 
 
-def mostrar(nome):
-    # salva a figura atual em FIG e mostra na tela
-    plt.savefig(FIG / f'{nome}.png', dpi=150, bbox_inches='tight')
-    plt.show()
-
 # Dados e divisão
-#
-# As duas tabelas se ligam pelo `id`. Uso log10 de Re (entrada) e de Cd (saída). A NACA 2412 sai
-# da base antes de tudo, e depois fica só a faixa de espessura de 6% a 16%.
-#
-# O split é por aerofólio (70/15/15). Se pontos do mesmo aerofólio caíssem em conjuntos
-# diferentes, o erro de teste ficaria bom demais. Um detalhe: os aerofólios sintéticos são
-# perturbações dos reais, então um sintético de teste pode ter o aerofólio de origem no treino. O
-# enunciado só pede a separação por `id`, e foi o que fiz.
+# - as duas tabelas se ligam pelo `id`
+# - log10 de Re (entrada) e de Cd (saída)
+# - a NACA 2412 sai da base antes de tudo, e depois fica só espessura de 6% a 16%
+# - o split é por aerofólio (70/15/15), senão pontos do mesmo aerofólio ficam em conjuntos diferentes e o teste fica bom demais
+# - os aerofólios sintéticos são perturbações dos reais, então um sintético de teste pode ter o original no treino. O enunciado só pede separar por `id`, então fiz assim
 
 airfoils = pd.read_csv(DB / 'airfoils.csv')
 polars = pd.read_csv(DB / 'polars.csv')
 
-# une pelo id, fica com o mesmo número de linhas de polars
+# une pelo id
 uni = pd.merge(polars, airfoils, on='id')
 
-# log de Re e de Cd
+# log de Re e Cd
 uni['LogRe'] = np.log10(uni['Re'])
 uni['LogCd'] = np.log10(uni['Cd'])
 
-# a naca2412 vira o alvo e sai da base, depois filtra a espessura
+# naca2412 vira o alvo e sai da base, depois filtra a espessura
 target = uni[uni['name'] == 'naca2412']
 assert len(target) > 0, 'naca2412 não está no airfoils.csv'
 uni = uni[uni['name'] != 'naca2412']
 uni = uni[(uni['t_max'] >= 0.06) & (uni['t_max'] <= 0.16)]
 
-# split por aerofólio: todos os pontos de um id ficam no mesmo conjunto
+# split por aerofólio (todos os pontos de um id no mesmo conjunto)
 rng = np.random.default_rng(30)
 ids = rng.permutation(uni['id'].unique())
 
@@ -79,9 +72,8 @@ print('Aerofólios treino/val/teste:', len(ids_tr), len(ids_val), len(ids_te))
 print('Pontos treino/val/teste:', len(treino), len(val), len(teste))
 
 # Estágio 1: preparação
-#
-# X tem 14 colunas (12 CST, alpha e log10 Re) e Y tem 3 (cl, log10 cd, cm). A média e o desvio vêm
-# só do treino e são aplicados nos outros conjuntos, inclusive na NACA 2412.
+# - X tem 14 colunas (12 CST, alpha e log10 Re) e Y tem 3 (cl, log10 cd, cm)
+# - média e desvio só do treino, aplicados nos outros conjuntos (inclusive a NACA 2412)
 
 X_columns = ['Au0', 'Au1', 'Au2', 'Au3', 'Au4', 'Au5',
              'Al0', 'Al1', 'Al2', 'Al3', 'Al4', 'Al5', 'alpha', 'LogRe']
@@ -117,19 +109,18 @@ Entrada_target = torch.tensor(X_target)
 
 
 # Estágio 1: rede e treino
-#
-# Duas camadas ocultas de 64 neurônios com tanh e saída linear (cl, log10 cd e cm podem ter
-# qualquer valor). A perda é o MSE, o otimizador é o Adam e o treino usa mini-lotes de 256. A
-# parada antecipada olha a validação: se ela não melhora por 20 épocas, o treino para e a rede
-# volta aos pesos da melhor época. A função `treina` também serve para o estágio 2.
+# - 2 camadas ocultas de 64 neurônios com tanh e saída linear
+# - MSE, Adam e mini-lotes de 256
+# - early stopping: se a validação não melhora por 20 épocas, para e volta aos pesos da melhor época
+# - a função `treina` também serve pro estágio 2
 
 def treina(rede, X, Y, Xv, Yv, lr=1e-3, batch=256, paciencia=20, max_epocas=500):
-    # Adam + MSE + early stopping. Devolve os históricos, a melhor época (contando de 1) e o melhor erro de validação
+    # Adam + MSE + early stopping, devolve históricos, melhor época e melhor erro de validação
     loss_fn = nn.MSELoss()
     otimizador = torch.optim.Adam(rede.parameters(), lr=lr)
     loader = DataLoader(TensorDataset(X, Y), batch_size=batch, shuffle=True)
 
-    melhor_val = float('inf')        # recorde, qualquer erro bate no começo
+    melhor_val = float('inf')        # melhor erro até agora
     contador = 0                     # épocas seguidas sem melhorar
     melhores_pesos = None
     hist_treino, hist_val = [], []
@@ -163,8 +154,8 @@ def treina(rede, X, Y, Xv, Yv, lr=1e-3, batch=256, paciencia=20, max_epocas=500)
 
 
 rede = nn.Sequential(
-    nn.Linear(14, 64),   # mistura as 14 entradas em 64 combinações
-    nn.Tanh(),           # sem isso a rede só aprenderia retas
+    nn.Linear(14, 64),
+    nn.Tanh(),
     nn.Linear(64, 64),
     nn.Tanh(),
     nn.Linear(64, 3)     # saída linear: Cl, LogCd e Cm
@@ -176,13 +167,12 @@ print('Melhor época:', melhor_epoca, '| erro de validação:', melhor_val)
 
 
 # Erros no teste
-#
-# RMSE de cl e de cm em unidades reais. Para o cd, volto do log com `10**x` e calculo o erro
-# relativo médio em %.
+# - RMSE de cl e cm em unidades reais
+# - no cd volto do log com `10**x` e calculo o erro relativo médio em %
 
 
 with torch.no_grad():
-    prev_teste = rede(Entrada_teste).numpy()          # ainda padronizada
+    prev_teste = rede(Entrada_teste).numpy()          # padronizada
 
 prev_teste_real = prev_teste * sy_tr + my_tr
 Y_teste_real = Y_teste * sy_tr + my_tr
@@ -198,8 +188,7 @@ print('RMSE cm:', rmse_cm)
 print('Erro médio cd (%):', erro_cd)
 
 # NACA 2412 (nunca vista)
-#
-# Rede contra XFOIL nos quatro Reynolds: curva de sustentação, polar de arrasto e momento.
+# - rede contra XFOIL nos 4 Reynolds: curva de sustentação, polar de arrasto e momento
 
 with torch.no_grad():
     prev_target = rede(Entrada_target).numpy()
@@ -217,7 +206,7 @@ print(f'NACA 2412: RMSE cl = {rmse_cl_na:.4f} | erro cd = {erro_cd_na:.2f} %')
 fig, ax = plt.subplots(1, 3, figsize=(15, 4))
 for Re_val in np.unique(Re_na):
     m = (Re_na == Re_val)
-    ordem = np.argsort(alpha_na[m])          # ordena por alpha para a linha não embaralhar
+    ordem = np.argsort(alpha_na[m])          # ordena por alpha
 
     a = alpha_na[m][ordem]
     cl_x, cl_r = Y_target_real[m, 0][ordem], prev_target_real[m, 0][ordem]
@@ -225,7 +214,7 @@ for Re_val in np.unique(Re_na):
     cd_x, cd_r = 10 ** Y_target_real[m, 1][ordem], 10 ** prev_target_real[m, 1][ordem]
 
     p = ax[0].plot(a, cl_x, 'o', label=f'Re = {Re_val:.0e}')
-    cor = p[0].get_color()                   # mesma cor para XFOIL e rede
+    cor = p[0].get_color()                   # mesma cor pro XFOIL e pra rede
     ax[0].plot(a, cl_r, '-', color=cor)
     ax[1].plot(cd_x, cl_x, 'o', color=cor)
     ax[1].plot(cd_r, cl_r, '-', color=cor)
@@ -237,13 +226,12 @@ ax[1].set_xlabel('c_d');       ax[1].set_ylabel('c_l'); ax[1].set_title('Polar d
 ax[2].set_xlabel('α [graus]'); ax[2].set_ylabel('c_m'); ax[2].set_title('Momento (1/4 de corda)')
 ax[0].legend()
 plt.tight_layout()
-mostrar('fig_naca2412_estagio1')
+plt.show()
 
-# Inclinação da curva de sustentação e centro aerodinâmico
-#
-# Na faixa linear (|alpha| <= 4 graus) ajusto uma reta. A inclinação de cl por alpha sai em
-# 1/grau, então multiplico por 180/pi para ter 1/rad. O centro aerodinâmico é 0,25 menos dcm/dcl,
-# e o dcm/dcl é a inclinação de cm contra cl.
+# Inclinação de cl e centro aerodinâmico
+# - faixa linear (|alpha| <= 4 graus), ajusto uma reta
+# - a inclinação sai em 1/grau, então multiplico por 180/pi pra ter 1/rad
+# - x_ac = 0,25 - dcm/dcl, e dcm/dcl é a inclinação de cm contra cl
 
 for Re_val in np.unique(Re_na):
     m = (Re_na == Re_val)
@@ -263,26 +251,24 @@ for Re_val in np.unique(Re_na):
     print(f'Re = {Re_val:.0e} | x_ac XFOIL = {xac_x:.4f} | rede = {xac_r:.4f}')
 
 # Curvas de aprendizado
-#
-# Erro de treino e de validação por época, em escala log, com a melhor época marcada.
+# - erro de treino e validação por época (escala log), com a melhor época marcada
 
-def grafico_MSExepoca(hist_treino, hist_val, melhor_epoca, nome):
+def grafico_MSExepoca(hist_treino, hist_val, melhor_epoca):
     plt.figure(figsize=(6, 4))
     plt.plot(range(1, len(hist_treino) + 1), hist_treino, label='treino')
     plt.plot(range(1, len(hist_val) + 1), hist_val, label='validação')
     plt.axvline(melhor_epoca, color='k', ls='--', lw=1, label=f'melhor época ({melhor_epoca})')
     plt.yscale('log')
     plt.xlabel('época'); plt.ylabel('MSE (saídas padronizadas)'); plt.legend()
-    mostrar(nome)
+    plt.show()
 
 
-grafico_MSExepoca(hist_treino, hist_val, melhor_epoca, 'fig_curvas_aprendizado')
+grafico_MSExepoca(hist_treino, hist_val, melhor_epoca)
 
 # Estágio 2: POD-NN para o Cp
-#
-# Os Cp só existem para Re = 1e6 e alpha de 0 a 8 graus, então esse modelo não tem entrada de
-# Reynolds e só vale nessa faixa. Os conjuntos são os mesmos aerofólios do estágio 1. Alguns
-# aerofólios não têm curva de Cp porque a limpeza do banco tirou polares de Re = 1e6.
+# - o Cp só existe pra Re = 1e6 e alpha de 0 a 8 graus, então não tem entrada de Reynolds e só vale nessa faixa
+# - mesmos aerofólios de treino, validação e teste do estágio 1
+# - alguns aerofólios ficam sem Cp porque a limpeza do banco tirou os polares de Re = 1e6
 
 d = np.load(DB / 'cp_Re1e6.npz')
 cp_id, cp_alpha, x_grid, cp = d['id'], d['alpha'], d['x'], d['cp'].astype(np.float64)
@@ -297,12 +283,11 @@ print('Curvas de Cp treino/val/teste/NACA:', m_tr.sum(), m_val.sum(), m_te.sum()
 print('Aerofólios com Cp no treino:', len(np.unique(cp_id[m_tr])))
 
 # Padrões (SVD)
-#
-# Subtraio a curva média do treino, monto a matriz de 200 linhas por N curvas e calculo a SVD
-# econômica. As colunas de U são os modos POD. Fico com o menor r cuja energia acumulada chega a
-# 99,9%.
+# - subtraio a curva média do treino e monto a matriz 200 x N curvas
+# - SVD econômica, as colunas de U são os modos POD
+# - fico com o menor r que chega a 99,9% da energia acumulada
 
-cp_medio = cp[m_tr].mean(axis=0)               # curva média, só do treino
+cp_medio = cp[m_tr].mean(axis=0)               # curva média do treino
 X_snap = (cp[m_tr] - cp_medio).T               # 200 x N_treino
 U, S, Vt = np.linalg.svd(X_snap, full_matrices=False)
 
@@ -322,7 +307,7 @@ ax[1].axhline(0.999, color='k', ls='--', lw=1)
 ax[1].axvline(r, color='r', ls='--', lw=1, label=f'r = {r}')
 ax[1].set_xlabel('r'); ax[1].set_ylabel('E(r)'); ax[1].set_title('Energia acumulada'); ax[1].legend()
 plt.tight_layout()
-mostrar('fig_energia_modos')
+plt.show()
 
 fig, ax = plt.subplots(1, 4, figsize=(16, 3.6))
 for j in range(4):
@@ -332,14 +317,12 @@ for j in range(4):
     ax[j].set_xlabel('x/c')
 ax[0].legend()
 plt.tight_layout()
-mostrar('fig_modos')
+plt.show()
 
 # Gabarito e piso de projeção
-#
-# Como os modos são ortonormais, os coeficientes de uma curva são a = Phi^T (Cp - média). Projetar
-# todas as curvas (treino, validação, teste e NACA) dá o gabarito que a rede vai tentar prever. O
-# piso de projeção é o erro de reconstruir as curvas de teste com os coeficientes exatos, que é o
-# melhor resultado possível com r modos.
+# - modos ortonormais, então os coeficientes são a = Phi^T (Cp - média)
+# - projetar todas as curvas dá o gabarito que a rede tenta prever
+# - piso de projeção: erro de reconstruir o teste com os coeficientes exatos, é o melhor possível com r modos
 
 A_all = (cp - cp_medio) @ Phi                  # N x r
 
@@ -353,10 +336,9 @@ rmse_piso_na = np.sqrt(np.mean((reconstroi(A_all[m_na]) - cp[m_na]) ** 2))
 print(f'Piso de projeção (teste): RMSE de Cp = {rmse_piso:.5f}')
 
 # Rede do estágio 2
-#
-# Entradas: 12 CST e alpha (13, padronizadas com o treino). Saídas: os r coeficientes divididos
-# por um único número, o desvio do primeiro. Padronizar cada coeficiente separado daria o mesmo
-# peso aos modos de pouca energia, e a perda deixaria de acompanhar o erro da curva.
+# - entradas: 12 CST e alpha (13, padronizadas com o treino)
+# - saídas: os r coeficientes divididos pelo desvio do primeiro
+# - padronizar cada coeficiente separado daria o mesmo peso pros modos de pouca energia, e a perda não acompanharia mais o erro da curva
 
 cst = airfoils.set_index('id')[X_columns[:12]]
 X_cp = np.column_stack([cst.loc[cp_id].values, cp_alpha]).astype(np.float32)
@@ -364,7 +346,7 @@ X_cp = np.column_stack([cst.loc[cp_id].values, cp_alpha]).astype(np.float32)
 mx2, sx2 = X_cp[m_tr].mean(axis=0), X_cp[m_tr].std(axis=0)
 X_cp_s = (X_cp - mx2) / sx2
 
-escala = A_all[m_tr][:, 0].std()               # um número só para todos os coeficientes
+escala = A_all[m_tr][:, 0].std()               # um número só pra todos os coeficientes
 A_s = (A_all / escala).astype(np.float32)
 
 E_tr, S_tr = torch.tensor(X_cp_s[m_tr]), torch.tensor(A_s[m_tr])
@@ -381,9 +363,9 @@ h_tr2, h_va2, melhor_epoca2, melhor_val2 = treina(
 print('Estágio 2: melhor época', melhor_epoca2, '| MSE de validação:', melhor_val2)
 
 # Uso e resultado
-#
-# Com os coeficientes previstos, a soma dos modos reconstrói o Cp. Comparo o RMSE no teste com o
-# piso de projeção e faço o gráfico da NACA 2412 em 0, 4 e 8 graus.
+# - a soma dos modos com os coeficientes previstos reconstrói o Cp
+# - comparo o RMSE do teste com o piso de projeção
+# - gráfico da NACA 2412 em 0, 4 e 8 graus
 
 with torch.no_grad():
     A_prev = rede2(torch.tensor(X_cp_s)).numpy() * escala
@@ -405,4 +387,28 @@ for k, al in enumerate([0, 4, 8]):
     ax[k].set_xlabel('x/c'); ax[k].set_ylabel('Cp'); ax[k].set_title(f'NACA 2412, α = {al}°')
 ax[0].legend()
 plt.tight_layout()
-mostrar('fig_cp_naca2412')
+plt.show()
+
+
+# Fontes
+#
+# Bibliotecas
+# - PyTorch, montar a rede (nn.Sequential): https://pytorch.org/docs/stable/generated/torch.nn.Sequential.html
+# - PyTorch, otimizador Adam: https://pytorch.org/docs/stable/generated/torch.optim.Adam.html
+# - PyTorch, DataLoader e TensorDataset: https://pytorch.org/docs/stable/data.html
+# - PyTorch, tutorial de como montar uma rede: https://pytorch.org/tutorials/beginner/basics/buildmodel_tutorial.html
+# - NumPy, SVD (np.linalg.svd): https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html
+# - NumPy, ajuste de reta (np.polyfit): https://numpy.org/doc/stable/reference/generated/numpy.polyfit.html
+# - pandas, juntar tabelas (pd.merge): https://pandas.pydata.org/docs/reference/api/pandas.merge.html
+# - matplotlib, gráficos (plt.subplots): https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.subplots.html
+#
+# Dados e ferramentas
+# - XFOIL: https://web.mit.edu/drela/Public/web/xfoil/
+# - UIUC Airfoil Coordinates Database: https://m-selig.ae.illinois.edu/ads/coord_database.html
+# - base da disciplina: README da pasta airfoil_db_v1_to_students
+#
+# Métodos
+# - Adam: Kingma e Ba (2014): https://arxiv.org/abs/1412.6980
+# - POD (Proper Orthogonal Decomposition): https://en.wikipedia.org/wiki/Proper_orthogonal_decomposition
+# - early stopping: Goodfellow et al., Deep Learning, cap. 7: https://www.deeplearningbook.org/
+# - coeficientes CST: Kulfan (2008), Universal Parametric Geometry Representation Method, Journal of Aircraft
